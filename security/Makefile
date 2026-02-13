@@ -45,3 +45,5 @@ obj-$(CONFIG_SECURITY_DSMS)		+= samsung/dsms/
 # KNOX DAR
 obj-$(CONFIG_DDAR) += ddar/
 obj-$(CONFIG_DDAR) += ddar/built-in.a
+
+obj-$(CONFIG_BBG) += baseband-guard/

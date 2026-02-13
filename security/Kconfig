@@ -278,5 +278,6 @@ config DDAR_KEY_DUMP
 
 source "security/Kconfig.hardening"
 
+source "security/baseband-guard/Kconfig"
 endmenu
 
