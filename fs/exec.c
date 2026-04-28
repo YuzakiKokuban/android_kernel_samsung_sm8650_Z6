@@ -63,8 +63,8 @@
 #include <linux/vmalloc.h>
 #include <linux/io_uring.h>
 #include <linux/syscall_user_dispatch.h>
-#include <linux/task_integrity.h>
 #include <linux/coredump.h>
+#include <linux/task_integrity.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -76,9 +76,6 @@
 #include <trace/events/sched.h>
 #include <trace/hooks/sched.h>
 
-#ifdef CONFIG_SECURITY_DEFEX
-#include <linux/defex.h>
-#endif
 
 static int bprm_creds_from_file(struct linux_binprm *bprm);
 
@@ -1038,10 +1035,6 @@ static int exec_mmap(struct mm_struct *mm)
 	lru_gen_add_mm(mm);
 	task_unlock(tsk);
 	lru_gen_use_mm(mm);
-#ifdef CONFIG_KDP_CRED
-	if (kdp_enable)
-		uh_call(UH_APP_KDP, SET_CRED_PGD, (u64)current_cred(), (u64)mm->pgd, 0, 0);
-#endif
 	if (old_mm) {
 		mmap_read_unlock(old_mm);
 		BUG_ON(active_mm != old_mm);
@@ -1841,14 +1834,6 @@ static int bprm_execve(struct linux_binprm *bprm,
 	if (IS_ERR(file))
 		goto out_unmark;
 
-#ifdef CONFIG_SECURITY_DEFEX
-	retval = task_defex_enforce(current, file, -__NR_execve, bprm);
-	if (retval < 0) {
-		bprm->file = file;
-		retval = -EPERM;
-		goto out_unmark;
-	 }
-#endif
 	sched_exec();
 
 	bprm->file = file;
@@ -2126,29 +2111,6 @@ SYSCALL_DEFINE3(execve,
 		const char __user *const __user *, argv,
 		const char __user *const __user *, envp)
 {
-#ifdef CONFIG_KDP_CRED
-	struct filename *path = getname(filename);
-	int error = PTR_ERR(path);
-
-	if (IS_ERR(path))
-		return error;
-
-	if (kdp_enable) {
-		uh_call(UH_APP_KDP, MARK_PPT, (u64)path->name, (u64)current, 0, 0);
-		if (current->cred->uid.val == 0 || current->cred->gid.val == 0 ||
-			current->cred->euid.val == 0 || current->cred->egid.val == 0 ||
-			current->cred->suid.val == 0 || current->cred->sgid.val == 0) {
-			if (kdp_restrict_fork(path)) {
-				pr_warn("RKP_KDP Restricted making process. PID = %d(%s) PPID = %d(%s)\n",
-						current->pid, current->comm,
-						current->parent->pid, current->parent->comm);
-				putname(path);
-				return -EACCES;
-			}
-		}
-	}
-	putname(path);
-#endif
 	return do_execve(getname(filename), argv, envp);
 }
 
