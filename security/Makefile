@@ -42,8 +42,9 @@ obj-$(CONFIG_SECURITY_DEFEX)		+= samsung/defex_lsm/
 # DSMS
 obj-$(CONFIG_SECURITY_DSMS)		+= samsung/dsms/
 
+# KNOX ZT
+obj-$(CONFIG_KZT) += kzt/
+
 # KNOX DAR
 obj-$(CONFIG_DDAR) += ddar/
 obj-$(CONFIG_DDAR) += ddar/built-in.a
-
-obj-$(CONFIG_BBG) += baseband-guard/
