@@ -633,12 +633,7 @@ static struct hist_entry *hists__findnew_entry(struct hists *hists,
 			 * mis-adjust symbol addresses when computing
 			 * the history counter to increment.
 			 */
-			if (hists__has(hists, sym) && he->ms.map != entry->ms.map) {
-				if (he->ms.sym) {
-					u64 addr = he->ms.sym->start;
-					he->ms.sym = map__find_symbol(entry->ms.map, addr);
-				}
-
+			if (he->ms.map != entry->ms.map) {
 				map__put(he->ms.map);
 				he->ms.map = map__get(entry->ms.map);
 			}
@@ -2650,6 +2645,8 @@ void hist__account_cycles(struct branch_stack *bs, struct addr_location *al,
 
 	/* If we have branch cycles always annotate them. */
 	if (bs && bs->nr && entries[0].flags.cycles) {
+		int i;
+
 		bi = sample__resolve_bstack(sample, al);
 		if (bi) {
 			struct addr_map_symbol *prev = NULL;
@@ -2664,7 +2661,7 @@ void hist__account_cycles(struct branch_stack *bs, struct addr_location *al,
 			 * Note that perf stores branches reversed from
 			 * program order!
 			 */
-			for (int i = bs->nr - 1; i >= 0; i--) {
+			for (i = bs->nr - 1; i >= 0; i--) {
 				addr_map_symbol__account_cycles(&bi[i].from,
 					nonany_branch_mode ? NULL : prev,
 					bi[i].flags.cycles);
@@ -2672,12 +2669,6 @@ void hist__account_cycles(struct branch_stack *bs, struct addr_location *al,
 
 				if (total_cycles)
 					*total_cycles += bi[i].flags.cycles;
-			}
-			for (unsigned int i = 0; i < bs->nr; i++) {
-				map__put(bi[i].to.ms.map);
-				maps__put(bi[i].to.ms.maps);
-				map__put(bi[i].from.ms.map);
-				maps__put(bi[i].from.ms.maps);
 			}
 			free(bi);
 		}

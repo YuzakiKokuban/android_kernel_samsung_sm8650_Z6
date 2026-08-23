@@ -1234,10 +1234,8 @@ openRetry:
 		*oplock |= CIFS_CREATE_ACTION;
 
 	if (buf) {
-		/* copy commonly used attributes */
-		memcpy(&buf->common_attributes,
-		       &rsp->common_attributes,
-		       sizeof(buf->common_attributes));
+		/* copy from CreationTime to Attributes */
+		memcpy((char *)buf, (char *)&rsp->CreationTime, 36);
 		/* the file_info buf is endian converted by caller */
 		buf->AllocationSize = rsp->AllocationSize;
 		buf->EndOfFile = rsp->EndOfFile;
@@ -5349,7 +5347,7 @@ SetTimesRetry:
 	param_offset = offsetof(struct smb_com_transaction2_spi_req,
 				InformationLevel) - 4;
 	offset = param_offset + params;
-	data_offset = (char *)pSMB + offsetof(typeof(*pSMB), hdr.Protocol) + offset;
+	data_offset = (char *) (&pSMB->hdr.Protocol) + offset;
 	pSMB->ParameterOffset = cpu_to_le16(param_offset);
 	pSMB->DataOffset = cpu_to_le16(offset);
 	pSMB->SetupCount = 1;

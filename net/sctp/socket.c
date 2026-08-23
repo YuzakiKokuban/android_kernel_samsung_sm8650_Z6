@@ -2098,13 +2098,6 @@ static int sctp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
 	pr_debug("%s: sk:%p, msghdr:%p, len:%zd, flags:0x%x, addr_len:%p)\n",
 		 __func__, sk, msg, len, flags, addr_len);
 
-	if (unlikely(flags & MSG_ERRQUEUE))
-		return inet_recv_error(sk, msg, len, addr_len);
-
-	if (sk_can_busy_loop(sk) &&
-	    skb_queue_empty_lockless(&sk->sk_receive_queue))
-		sk_busy_loop(sk, flags & MSG_DONTWAIT);
-
 	lock_sock(sk);
 
 	if (sctp_style(sk, TCP) && !sctp_sstate(sk, ESTABLISHED) &&
@@ -7116,7 +7109,6 @@ static int sctp_getsockopt_assoc_ids(struct sock *sk, int len,
 	struct sctp_sock *sp = sctp_sk(sk);
 	struct sctp_association *asoc;
 	struct sctp_assoc_ids *ids;
-	size_t ids_size;
 	u32 num = 0;
 
 	if (sctp_style(sk, TCP))
@@ -7129,11 +7121,11 @@ static int sctp_getsockopt_assoc_ids(struct sock *sk, int len,
 		num++;
 	}
 
-	ids_size = struct_size(ids, gaids_assoc_id, num);
-	if (len < ids_size)
+	if (len < sizeof(struct sctp_assoc_ids) + sizeof(sctp_assoc_t) * num)
 		return -EINVAL;
 
-	len = ids_size;
+	len = sizeof(struct sctp_assoc_ids) + sizeof(sctp_assoc_t) * num;
+
 	ids = kmalloc(len, GFP_USER | __GFP_NOWARN);
 	if (unlikely(!ids))
 		return -ENOMEM;
@@ -8520,7 +8512,6 @@ static int sctp_listen_start(struct sock *sk, int backlog)
 	struct sctp_endpoint *ep = sp->ep;
 	struct crypto_shash *tfm = NULL;
 	char alg[32];
-	int err;
 
 	/* Allocate HMAC for generating cookie. */
 	if (!sp->hmac && sp->sctp_hmac_alg) {
@@ -8547,26 +8538,17 @@ static int sctp_listen_start(struct sock *sk, int backlog)
 	 */
 	inet_sk_set_state(sk, SCTP_SS_LISTENING);
 	if (!ep->base.bind_addr.port) {
-		if (sctp_autobind(sk)) {
-			err = -EAGAIN;
-			goto err;
-		}
+		if (sctp_autobind(sk))
+			return -EAGAIN;
 	} else {
 		if (sctp_get_port(sk, inet_sk(sk)->inet_num)) {
-			err = -EADDRINUSE;
-			goto err;
+			inet_sk_set_state(sk, SCTP_SS_CLOSED);
+			return -EADDRINUSE;
 		}
 	}
 
 	WRITE_ONCE(sk->sk_max_ack_backlog, backlog);
-	err = sctp_hash_endpoint(ep);
-	if (err)
-		goto err;
-
-	return 0;
-err:
-	inet_sk_set_state(sk, SCTP_SS_CLOSED);
-	return err;
+	return sctp_hash_endpoint(ep);
 }
 
 /*
@@ -9056,6 +9038,12 @@ struct sk_buff *sctp_skb_recv_datagram(struct sock *sk, int flags, int *err)
 		if (sk->sk_shutdown & RCV_SHUTDOWN)
 			break;
 
+		if (sk_can_busy_loop(sk)) {
+			sk_busy_loop(sk, flags & MSG_DONTWAIT);
+
+			if (!skb_queue_empty_lockless(&sk->sk_receive_queue))
+				continue;
+		}
 
 		/* User doesn't want to wait.  */
 		error = -EAGAIN;

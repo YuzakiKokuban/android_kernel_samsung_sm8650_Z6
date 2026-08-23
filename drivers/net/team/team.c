@@ -285,10 +285,8 @@ static int __team_options_register(struct team *team,
 	return 0;
 
 inst_rollback:
-	for (i--; i >= 0; i--) {
+	for (i--; i >= 0; i--)
 		__team_option_inst_del_option(team, dst_opts[i]);
-		list_del(&dst_opts[i]->list);
-	}
 
 	i = option_count;
 alloc_rollback:
@@ -984,8 +982,7 @@ static void team_port_disable(struct team *team,
 
 #define TEAM_VLAN_FEATURES (NETIF_F_HW_CSUM | NETIF_F_SG | \
 			    NETIF_F_FRAGLIST | NETIF_F_GSO_SOFTWARE | \
-			    NETIF_F_HIGHDMA | NETIF_F_LRO | \
-			    NETIF_F_GSO_ENCAP_ALL)
+			    NETIF_F_HIGHDMA | NETIF_F_LRO)
 
 #define TEAM_ENC_FEATURES	(NETIF_F_HW_CSUM | NETIF_F_SG | \
 				 NETIF_F_RXCSUM | NETIF_F_GSO_SOFTWARE)

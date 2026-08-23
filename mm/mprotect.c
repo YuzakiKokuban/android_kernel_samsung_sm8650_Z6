@@ -17,7 +17,6 @@
 #include <linux/highmem.h>
 #include <linux/security.h>
 #include <linux/mempolicy.h>
-#include <linux/pgsize_migration.h>
 #include <linux/personality.h>
 #include <linux/syscalls.h>
 #include <linux/swap.h>

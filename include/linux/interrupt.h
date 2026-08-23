@@ -590,8 +590,7 @@ enum
 #define LONG_SOFTIRQ_MASK (BIT(NET_TX_SOFTIRQ)    | \
 			   BIT(NET_RX_SOFTIRQ)    | \
 			   BIT(BLOCK_SOFTIRQ)     | \
-			   BIT(IRQ_POLL_SOFTIRQ)  | \
-			   BIT(TASKLET_SOFTIRQ))
+			   BIT(IRQ_POLL_SOFTIRQ))
 
 /* map softirq index to softirq name. update 'softirq_to_name' in
  * kernel/softirq.c when adding a new softirq.

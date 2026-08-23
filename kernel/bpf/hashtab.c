@@ -155,15 +155,13 @@ static inline int htab_lock_bucket(const struct bpf_htab *htab,
 	hash = hash & min_t(u32, HASHTAB_MAP_LOCK_MASK, htab->n_buckets - 1);
 
 	preempt_disable();
-	local_irq_save(flags);
 	if (unlikely(__this_cpu_inc_return(*(htab->map_locked[hash])) != 1)) {
 		__this_cpu_dec(*(htab->map_locked[hash]));
-		local_irq_restore(flags);
 		preempt_enable();
 		return -EBUSY;
 	}
 
-	raw_spin_lock(&b->raw_lock);
+	raw_spin_lock_irqsave(&b->raw_lock, flags);
 	*pflags = flags;
 
 	return 0;
@@ -174,9 +172,8 @@ static inline void htab_unlock_bucket(const struct bpf_htab *htab,
 				      unsigned long flags)
 {
 	hash = hash & min_t(u32, HASHTAB_MAP_LOCK_MASK, htab->n_buckets - 1);
-	raw_spin_unlock(&b->raw_lock);
+	raw_spin_unlock_irqrestore(&b->raw_lock, flags);
 	__this_cpu_dec(*(htab->map_locked[hash]));
-	local_irq_restore(flags);
 	preempt_enable();
 }
 
@@ -455,9 +452,6 @@ static int htab_map_alloc_check(union bpf_attr *attr)
 		 * kmalloc-able later in htab_map_update_elem()
 		 */
 		return -E2BIG;
-	/* percpu map value size is bound by PCPU_MIN_UNIT_SIZE */
-	if (percpu && round_up(attr->value_size, 8) > PCPU_MIN_UNIT_SIZE)
-		return -E2BIG;
 
 	return 0;
 }
@@ -498,13 +492,7 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 							  num_possible_cpus());
 	}
 
-	/* hash table size must be power of 2; roundup_pow_of_two() can overflow
-	 * into UB on 32-bit arches, so check that first
-	 */
-	err = -E2BIG;
-	if (htab->map.max_entries > 1UL << 31)
-		goto free_htab;
-
+	/* hash table size must be power of 2 */
 	htab->n_buckets = roundup_pow_of_two(htab->map.max_entries);
 
 	htab->elem_size = sizeof(struct htab_elem) +
@@ -514,8 +502,10 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
 	else
 		htab->elem_size += round_up(htab->map.value_size, 8);
 
-	/* check for u32 overflow */
-	if (htab->n_buckets > U32_MAX / sizeof(struct bucket))
+	err = -E2BIG;
+	/* prevent zero size kmalloc and check for u32 overflow */
+	if (htab->n_buckets == 0 ||
+	    htab->n_buckets > U32_MAX / sizeof(struct bucket))
 		goto free_htab;
 
 	err = -ENOMEM;

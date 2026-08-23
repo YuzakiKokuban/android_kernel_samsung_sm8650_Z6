@@ -296,9 +296,7 @@ static int amd_pstate_target(struct cpufreq_policy *policy,
 static unsigned int amd_pstate_fast_switch(struct cpufreq_policy *policy,
 				  unsigned int target_freq)
 {
-	if (!amd_pstate_update_freq(policy, target_freq, true))
-		return target_freq;
-	return policy->cur;
+	return amd_pstate_update_freq(policy, target_freq, true);
 }
 
 static void amd_pstate_adjust_perf(unsigned int cpu,
@@ -320,7 +318,7 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
 	if (target_perf < capacity)
 		des_perf = DIV_ROUND_UP(cap_perf * target_perf, capacity);
 
-	min_perf = READ_ONCE(cpudata->lowest_perf);
+	min_perf = READ_ONCE(cpudata->highest_perf);
 	if (_min_perf < capacity)
 		min_perf = DIV_ROUND_UP(cap_perf * _min_perf, capacity);
 

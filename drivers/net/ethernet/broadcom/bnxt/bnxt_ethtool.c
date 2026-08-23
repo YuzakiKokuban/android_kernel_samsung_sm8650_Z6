@@ -164,8 +164,9 @@ static int bnxt_set_coalesce(struct net_device *dev,
 reset_coalesce:
 	if (test_bit(BNXT_STATE_OPEN, &bp->state)) {
 		if (update_stats) {
-			bnxt_close_nic(bp, true, false);
-			rc = bnxt_open_nic(bp, true, false);
+			rc = bnxt_close_nic(bp, true, false);
+			if (!rc)
+				rc = bnxt_open_nic(bp, true, false);
 		} else {
 			rc = bnxt_hwrm_set_coal(bp);
 		}
@@ -955,7 +956,12 @@ static int bnxt_set_channels(struct net_device *dev,
 			 * before PF unload
 			 */
 		}
-		bnxt_close_nic(bp, true, false);
+		rc = bnxt_close_nic(bp, true, false);
+		if (rc) {
+			netdev_err(bp->dev, "Set channel failure rc :%x\n",
+				   rc);
+			return rc;
+		}
 	}
 
 	if (sh) {
@@ -2980,7 +2986,7 @@ static void bnxt_get_pkgver(struct net_device *dev)
 
 	if (!bnxt_get_pkginfo(dev, buf, sizeof(buf))) {
 		len = strlen(bp->fw_ver_str);
-		snprintf(bp->fw_ver_str + len, FW_VER_STR_LEN - len,
+		snprintf(bp->fw_ver_str + len, FW_VER_STR_LEN - len - 1,
 			 "/pkg %s", buf);
 	}
 }
@@ -3628,7 +3634,12 @@ static void bnxt_self_test(struct net_device *dev, struct ethtool_test *etest,
 		bnxt_run_fw_tests(bp, test_mask, &test_results);
 	} else {
 		bnxt_ulp_stop(bp);
-		bnxt_close_nic(bp, true, false);
+		rc = bnxt_close_nic(bp, true, false);
+		if (rc) {
+			etest->flags |= ETH_TEST_FL_FAILED;
+			bnxt_ulp_start(bp, rc);
+			return;
+		}
 		bnxt_run_fw_tests(bp, test_mask, &test_results);
 
 		buf[BNXT_MACLPBK_TEST_IDX] = 1;

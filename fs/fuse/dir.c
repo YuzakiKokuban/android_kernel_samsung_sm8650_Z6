@@ -426,12 +426,7 @@ static int fuse_dentry_canonical_path(const struct path *path,
 
 #ifdef CONFIG_FUSE_BPF
 	struct fuse_err_ret fer;
-#endif
 
-	if (fm->fc->no_dentry_canonical_path)
-		goto out;
-
-#ifdef CONFIG_FUSE_BPF
 	fer = fuse_bpf_backing(inode, struct fuse_dummy_io,
 			       fuse_canonical_path_initialize,
 			       fuse_canonical_path_backing,
@@ -458,13 +453,9 @@ static int fuse_dentry_canonical_path(const struct path *path,
 	free_page((unsigned long)path_name);
 	if (err > 0)
 		return 0;
-	if (err < 0 && err != -ENOSYS)
+	if (err < 0)
 		return err;
 
-	if (err == -ENOSYS)
-		fm->fc->no_dentry_canonical_path = 1;
-
-out:
 	canonical_path->dentry = path->dentry;
 	canonical_path->mnt = path->mnt;
 	path_get(canonical_path);
@@ -576,10 +567,6 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
 			goto out_put_forget;
 		if (fuse_invalid_attr(&outarg->attr))
 			goto out_put_forget;
-		if (outarg->nodeid == FUSE_ROOT_ID && outarg->generation != 0) {
-			pr_warn_once("root generation should be zero\n");
-			outarg->generation = 0;
-		}
 
 		*inode = fuse_iget(sb, outarg->nodeid, outarg->generation,
 				   &outarg->attr, entry_attr_timeout(outarg),
@@ -662,7 +649,7 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
 }
 
 static int get_security_context(struct dentry *entry, umode_t mode,
-				struct fuse_in_arg *ext)
+				void **security_ctx, u32 *security_ctxlen)
 {
 	struct fuse_secctx *fctx;
 	struct fuse_secctx_header *header;
@@ -709,40 +696,12 @@ static int get_security_context(struct dentry *entry, umode_t mode,
 
 		memcpy(ptr, ctx, ctxlen);
 	}
-	ext->size = total_len;
-	ext->value = header;
+	*security_ctxlen = total_len;
+	*security_ctx = header;
 	err = 0;
 out_err:
 	kfree(ctx);
 	return err;
-}
-
-static int get_create_ext(struct fuse_args *args, struct dentry *dentry,
-			  umode_t mode)
-{
-	struct fuse_conn *fc = get_fuse_conn_super(dentry->d_sb);
-	struct fuse_in_arg ext = { .size = 0, .value = NULL };
-	int err = 0;
-
-	if (fc->init_security)
-		err = get_security_context(dentry, mode, &ext);
-
-	if (!err && ext.size) {
-		WARN_ON(args->in_numargs >= ARRAY_SIZE(args->in_args));
-		args->is_ext = true;
-		args->ext_idx = args->in_numargs++;
-		args->in_args[args->ext_idx] = ext;
-	} else {
-		kfree(ext.value);
-	}
-
-	return err;
-}
-
-static void free_ext_value(struct fuse_args *args)
-{
-	if (args->is_ext)
-		kfree(args->in_args[args->ext_idx].value);
 }
 
 /*
@@ -766,6 +725,8 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	struct fuse_entry_out outentry;
 	struct fuse_inode *fi;
 	struct fuse_file *ff;
+	void *security_ctx = NULL;
+	u32 security_ctxlen;
 	bool trunc = flags & O_TRUNC;
 
 	/* Userspace expects S_IFREG in create mode */
@@ -823,12 +784,19 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	args.out_args[1].size = sizeof(outopen);
 	args.out_args[1].value = &outopen;
 
-	err = get_create_ext(&args, entry, mode);
-	if (err)
-		goto out_free_ff;
+	if (fm->fc->init_security) {
+		err = get_security_context(entry, mode, &security_ctx,
+					   &security_ctxlen);
+		if (err)
+			goto out_put_forget_req;
+
+		args.in_numargs = 3;
+		args.in_args[2].size = security_ctxlen;
+		args.in_args[2].value = security_ctx;
+	}
 
 	err = fuse_simple_request(fm, &args);
-	free_ext_value(&args);
+	kfree(security_ctx);
 	if (err)
 		goto out_free_ff;
 
@@ -936,6 +904,8 @@ static int create_new_entry(struct fuse_mount *fm, struct fuse_args *args,
 	struct dentry *d;
 	int err;
 	struct fuse_forget_link *forget;
+	void *security_ctx = NULL;
+	u32 security_ctxlen;
 
 	if (fuse_is_bad(dir))
 		return -EIO;
@@ -950,14 +920,21 @@ static int create_new_entry(struct fuse_mount *fm, struct fuse_args *args,
 	args->out_args[0].size = sizeof(outarg);
 	args->out_args[0].value = &outarg;
 
-	if (args->opcode != FUSE_LINK) {
-		err = get_create_ext(args, entry, mode);
+	if (fm->fc->init_security && args->opcode != FUSE_LINK) {
+		err = get_security_context(entry, mode, &security_ctx,
+					   &security_ctxlen);
 		if (err)
 			goto out_put_forget_req;
+
+		BUG_ON(args->in_numargs != 2);
+
+		args->in_numargs = 3;
+		args->in_args[2].size = security_ctxlen;
+		args->in_args[2].value = security_ctx;
 	}
 
 	err = fuse_simple_request(fm, args);
-	free_ext_value(args);
+	kfree(security_ctx);
 	if (err)
 		goto out_put_forget_req;
 
@@ -1489,7 +1466,7 @@ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
 }
 
 int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
-			     u64 child_nodeid, struct qstr *name, u32 flags)
+			     u64 child_nodeid, struct qstr *name)
 {
 	int err = -ENOTDIR;
 	struct inode *parent;
@@ -1516,9 +1493,7 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
 		goto unlock;
 
 	fuse_dir_changed(parent);
-	if (!(flags & FUSE_EXPIRE_ONLY))
-		d_invalidate(entry);
-	fuse_invalidate_entry_cache(entry);
+	fuse_invalidate_entry(entry);
 
 	if (child_nodeid != 0 && d_really_is_positive(entry)) {
 		inode_lock(d_inode(entry));

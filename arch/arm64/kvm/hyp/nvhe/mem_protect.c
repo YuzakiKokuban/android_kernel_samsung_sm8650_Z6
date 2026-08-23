@@ -149,16 +149,22 @@ static void prepare_host_vtcr(void)
 static int prepopulate_host_stage2(void)
 {
 	struct memblock_region *reg;
-	int i, ret = 0;
+	u64 addr = 0;
+	int i, ret;
 
 	for (i = 0; i < hyp_memblock_nr; i++) {
 		reg = &hyp_memory[i];
+		ret = host_stage2_idmap_locked(addr, reg->base - addr, PKVM_HOST_MMIO_PROT, false);
+		if (ret)
+			return ret;
 		ret = host_stage2_idmap_locked(reg->base, reg->size, PKVM_HOST_MEM_PROT, false);
 		if (ret)
 			return ret;
+		addr = reg->base + reg->size;
 	}
 
-	return ret;
+	return host_stage2_idmap_locked(addr, BIT(host_mmu.pgt.ia_bits) - addr, PKVM_HOST_MMIO_PROT,
+					false);
 }
 
 int kvm_host_prepare_stage2(void *pgt_pool_base)
@@ -875,14 +881,7 @@ void handle_host_mem_abort(struct kvm_cpu_context *host_ctxt)
 	int ret = -EPERM;
 
 	esr = read_sysreg_el2(SYS_ESR);
-	if (!__get_fault_info(esr, &fault)) {
-		addr = (u64)-1;
-		/*
-		 * We've presumably raced with a page-table change which caused
-		 * AT to fail, try again.
-		 */
-		goto return_to_host;
-	}
+	BUG_ON(!__get_fault_info(esr, &fault));
 	fault.esr_el2 = esr;
 
 	addr = (fault.hpfar_el2 & HPFAR_MASK) << 8;
@@ -909,7 +908,6 @@ void handle_host_mem_abort(struct kvm_cpu_context *host_ctxt)
 	else
 		BUG_ON(ret && ret != -EAGAIN);
 
-return_to_host:
 	trace_host_mem_abort(esr, addr);
 }
 
@@ -1122,9 +1120,7 @@ static int host_ack_donation(u64 addr, const struct pkvm_mem_transition *tx)
 
 static int host_ack_unshare(u64 addr, const struct pkvm_mem_transition *tx)
 {
-	u64 size = tx->nr_pages * PAGE_SIZE;
-
-	return __host_check_page_state_range(addr, size, PKVM_PAGE_SHARED_BORROWED);
+	return __host_ack_transition(addr, tx, PKVM_PAGE_SHARED_BORROWED);
 }
 
 static int host_complete_share(u64 addr, const struct pkvm_mem_transition *tx,
@@ -1238,6 +1234,9 @@ static int hyp_ack_unshare(u64 addr, const struct pkvm_mem_transition *tx)
 
 	if (tx->initiator.id == PKVM_ID_HOST && hyp_page_count((void *)addr))
 		return -EBUSY;
+
+	if (__hyp_ack_skip_pgtable_check(tx))
+		return 0;
 
 	return __hyp_check_page_state_range(addr, size,
 					    PKVM_PAGE_SHARED_BORROWED);
@@ -2009,90 +2008,82 @@ int __pkvm_hyp_donate_host(u64 pfn, u64 nr_pages)
 	return ret;
 }
 
+static int restrict_host_page_perms(u64 addr, kvm_pte_t pte, u32 level, enum kvm_pgtable_prot prot)
+{
+	int ret = 0;
+
+	/* XXX: optimize ... */
+	if (kvm_pte_valid(pte) && (level == KVM_PGTABLE_MAX_LEVELS - 1))
+		ret = kvm_pgtable_stage2_unmap(&host_mmu.pgt, addr, PAGE_SIZE);
+	if (!ret)
+		ret = host_stage2_idmap_locked(addr, PAGE_SIZE, prot, false);
+
+	return ret;
+}
+
 #define MODULE_PROT_ALLOWLIST (KVM_PGTABLE_PROT_RWX |	\
 			       KVM_PGTABLE_PROT_DEVICE |\
 			       KVM_PGTABLE_PROT_NC |	\
 			       KVM_PGTABLE_PROT_PXN |	\
 			       KVM_PGTABLE_PROT_UXN)
-
-int module_change_host_page_prot_range(u64 pfn, enum kvm_pgtable_prot prot, u64 nr_pages)
+int module_change_host_page_prot(u64 pfn, enum kvm_pgtable_prot prot)
 {
-	u64 i, addr = hyp_pfn_to_phys(pfn);
-	u64 end = addr + nr_pages * PAGE_SIZE;
+	u64 addr = hyp_pfn_to_phys(pfn);
 	struct hyp_page *page = NULL;
-	struct kvm_mem_range range;
-	bool is_mmio;
+	kvm_pte_t pte;
+	u32 level;
 	int ret;
 
 	if ((prot & MODULE_PROT_ALLOWLIST) != prot)
 		return -EINVAL;
 
-	is_mmio = !find_mem_range(addr, &range);
-	if (end > range.end) {
-		/* Specified range not in a single mmio or memory block. */
-		return -EPERM;
-	}
-
 	host_lock_component();
+	ret = kvm_pgtable_get_leaf(&host_mmu.pgt, addr, &pte, &level);
+	if (ret)
+		goto unlock;
 
 	/*
 	 * There is no hyp_vmemmap covering MMIO regions, which makes tracking
 	 * of module-owned MMIO regions hard, so we trust the modules not to
 	 * mess things up.
 	 */
-	if (is_mmio)
+	if (!addr_is_memory(addr))
 		goto update;
 
-	/* Range is memory: we can track module ownership. */
+	ret = -EPERM;
 	page = hyp_phys_to_page(addr);
 
 	/*
-	 * Modules can only modify pages they already own, and pristine host
-	 * pages. The entire range must be consistently one or the other.
+	 * Modules can only relax permissions of pages they own, and restrict
+	 * permissions of pristine pages.
 	 */
-	if (page->flags & MODULE_OWNED_PAGE) {
-		/* The entire range must be module-owned. */
-		ret = -EPERM;
-		for (i = 1; i < nr_pages; i++) {
-			if (!(page[i].flags & MODULE_OWNED_PAGE))
-				goto unlock;
-		}
-	} else {
-		/* The entire range must be pristine. */
-		ret = __host_check_page_state_range(
-			addr, nr_pages << PAGE_SHIFT, PKVM_PAGE_OWNED);
-		if (ret)
+	if (prot == KVM_PGTABLE_PROT_RWX) {
+		if (!(page->flags & MODULE_OWNED_PAGE))
 			goto unlock;
+	} else if (host_get_page_state(pte, addr) != PKVM_PAGE_OWNED) {
+		goto unlock;
 	}
 
 update:
-	if (!prot) {
-		ret = host_stage2_set_owner_locked(
-			addr, nr_pages << PAGE_SHIFT, PKVM_ID_PROTECTED);
-	} else {
-		ret = host_stage2_idmap_locked(
-			addr, nr_pages << PAGE_SHIFT, prot, false);
-	}
+	if (prot == default_host_prot(!!page))
+		ret = host_stage2_set_owner_locked(addr, PAGE_SIZE, PKVM_ID_HOST);
+	else if (!prot)
+		ret = host_stage2_set_owner_locked(addr, PAGE_SIZE, PKVM_ID_PROTECTED);
+	else
+		ret = restrict_host_page_perms(addr, pte, level, prot);
 
-	if (WARN_ON(ret) || !page)
+	if (ret || !page)
 		goto unlock;
 
-	for (i = 0; i < nr_pages; i++) {
-		if (prot != KVM_PGTABLE_PROT_RWX)
-			page[i].flags |= MODULE_OWNED_PAGE;
-		else
-			page[i].flags &= ~MODULE_OWNED_PAGE;
-	}
+	if (prot != KVM_PGTABLE_PROT_RWX)
+		hyp_phys_to_page(addr)->flags |= MODULE_OWNED_PAGE;
+	else
+		hyp_phys_to_page(addr)->flags &= ~MODULE_OWNED_PAGE;
 
 unlock:
 	host_unlock_component();
 
 	return ret;
-}
-
-int module_change_host_page_prot(u64 pfn, enum kvm_pgtable_prot prot)
-{
-	return module_change_host_page_prot_range(pfn, prot, 1);
 }
 
 int hyp_pin_shared_mem(void *from, void *to)

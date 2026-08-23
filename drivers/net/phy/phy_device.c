@@ -1803,16 +1803,14 @@ int phy_suspend(struct phy_device *phydev)
 	struct ethtool_wolinfo wol = { .cmd = ETHTOOL_GWOL };
 	struct net_device *netdev = phydev->attached_dev;
 	struct phy_driver *phydrv = phydev->drv;
-	bool wol_enabled = false;
 	int ret;
 
 	if (phydev->suspended)
 		return 0;
 
-	phy_ethtool_get_wol(phydev, &wol);
-	wol_enabled = wol.wolopts || (netdev && netdev->wol_enabled);
 	/* If the device has WOL enabled, we cannot suspend the PHY */
-	if (wol_enabled && !(phydrv->flags & PHY_ALWAYS_CALL_SUSPEND))
+	phy_ethtool_get_wol(phydev, &wol);
+	if (wol.wolopts || (netdev && netdev->wol_enabled))
 		return -EBUSY;
 
 	if (!phydrv || !phydrv->suspend)
@@ -2642,8 +2640,8 @@ EXPORT_SYMBOL(genphy_resume);
 int genphy_loopback(struct phy_device *phydev, bool enable)
 {
 	if (enable) {
-		u16 ctl = BMCR_LOOPBACK;
-		int ret, val;
+		u16 val, ctl = BMCR_LOOPBACK;
+		int ret;
 
 		ctl |= mii_bmcr_encode_fixed(phydev->speed, phydev->duplex);
 
@@ -2895,7 +2893,7 @@ s32 phy_get_internal_delay(struct phy_device *phydev, struct device *dev,
 	if (delay < 0)
 		return delay;
 
-	if (size == 0)
+	if (delay && size == 0)
 		return delay;
 
 	if (delay < delay_values[0] || delay > delay_values[size - 1]) {

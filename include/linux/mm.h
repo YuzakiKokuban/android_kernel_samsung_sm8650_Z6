@@ -27,7 +27,6 @@
 #include <linux/sizes.h>
 #include <linux/sched.h>
 #include <linux/pgtable.h>
-#include <linux/pgsize_migration_inline.h>
 #include <linux/kasan.h>
 #include <linux/page_pinner.h>
 #include <linux/memremap.h>
@@ -93,10 +92,6 @@ extern int mmap_rnd_bits __read_mostly;
 extern const int mmap_rnd_compat_bits_min;
 extern const int mmap_rnd_compat_bits_max;
 extern int mmap_rnd_compat_bits __read_mostly;
-#endif
-
-#ifndef PHYSMEM_END
-# define PHYSMEM_END	((1ULL << MAX_PHYSMEM_BITS) - 1)
 #endif
 
 #include <asm/page.h>
@@ -787,11 +782,6 @@ static inline void vma_assert_write_locked(struct vm_area_struct *vma)
 static inline void vma_mark_detached(struct vm_area_struct *vma,
 				     bool detached) {}
 
-static inline void vma_assert_locked(struct vm_area_struct *vma)
-{
-	mmap_assert_locked(vma->vm_mm);
-}
-
 static inline void release_fault_lock(struct vm_fault *vmf)
 {
 	mmap_read_unlock(vmf->vma->vm_mm);
@@ -841,8 +831,6 @@ static inline void vm_flags_reset(struct vm_area_struct *vma,
 				  vm_flags_t flags)
 {
 	vma_assert_write_locked(vma);
-	/* Preserve padding flags */
-	flags = vma_pad_fixup_flags(vma, flags);
 	vm_flags_init(vma, flags);
 }
 
@@ -850,8 +838,6 @@ static inline void vm_flags_reset_once(struct vm_area_struct *vma,
 				       vm_flags_t flags)
 {
 	vma_assert_write_locked(vma);
-	/* Preserve padding flags */
-	flags = vma_pad_fixup_flags(vma, flags);
 	WRITE_ONCE(ACCESS_PRIVATE(vma, __vm_flags), flags);
 }
 
@@ -3828,27 +3814,6 @@ madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
 extern phys_addr_t memmapsize;
 extern unsigned long physpages, codesize, datasize, rosize, bss_size;
 extern unsigned long init_code_size, init_data_size;
-
-#define MB_TO_PAGES(x) ((x) << (20 - PAGE_SHIFT))
-#define GB_TO_PAGES(x) ((x) << (30 - PAGE_SHIFT))
-
-static inline bool file_is_tiny(unsigned long low_threshold)
-{
-	return (global_node_page_state(NR_ACTIVE_FILE) +
-		global_node_page_state(NR_INACTIVE_FILE)) < low_threshold;
-}
-
-static inline unsigned long get_low_threshold(void)
-{
-	if (totalram_pages() > GB_TO_PAGES(4))
-		return MB_TO_PAGES(500);
-	else if (totalram_pages() > GB_TO_PAGES(3))
-		return MB_TO_PAGES(400);
-	else if (totalram_pages() > GB_TO_PAGES(2))
-		return MB_TO_PAGES(300);
-	else
-		return MB_TO_PAGES(200);
-}
 
 #define GPU_PAGE_MAGIC (0x9A0E06B9A0E)
 

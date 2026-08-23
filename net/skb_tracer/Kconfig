@@ -5,7 +5,7 @@
 config SKB_TRACER
 	tristate "skb tracer"
 	depends on NET
-	default n
+	select SKB_EXTENSIONS
 	help
           skb tracer
 

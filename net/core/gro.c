@@ -252,9 +252,8 @@ int skb_gro_receive(struct sk_buff *p, struct sk_buff *skb)
 	}
 
 merge:
-	/* sk ownership - if any - completely transferred to the aggregated packet */
+	/* sk owenrship - if any - completely transferred to the aggregated packet */
 	skb->destructor = NULL;
-	skb->sk = NULL;
 	delta_truesize = skb->truesize;
 	if (offset > headlen) {
 		unsigned int eat = offset - headlen;

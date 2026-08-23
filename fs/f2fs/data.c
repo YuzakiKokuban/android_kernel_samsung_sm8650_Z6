@@ -58,7 +58,7 @@ void f2fs_destroy_bioset(void)
 	bioset_exit(&f2fs_bioset);
 }
 
-bool f2fs_is_cp_guaranteed(struct page *page)
+static bool __is_cp_guaranteed(struct page *page)
 {
 	struct address_space *mapping = page->mapping;
 	struct inode *inode;
@@ -75,6 +75,8 @@ bool f2fs_is_cp_guaranteed(struct page *page)
 			S_ISDIR(inode->i_mode))
 		return true;
 
+	if (f2fs_is_compressed_page(page))
+		return false;
 	if ((S_ISREG(inode->i_mode) && IS_NOQUOTA(inode)) ||
 			page_private_gcing(page))
 		return true;
@@ -346,7 +348,7 @@ static void f2fs_write_end_io(struct bio *bio)
 
 	bio_for_each_segment_all(bvec, bio, iter_all) {
 		struct page *page = bvec->bv_page;
-		enum count_type type = WB_DATA_TYPE(page, false);
+		enum count_type type = WB_DATA_TYPE(page);
 
 		if (page_private_dummy(page)) {
 			clear_page_private_dummy(page);
@@ -806,7 +808,7 @@ int f2fs_submit_page_bio(struct f2fs_io_info *fio)
 		wbc_account_cgroup_owner(fio->io_wbc, fio->page, PAGE_SIZE);
 
 	inc_page_count(fio->sbi, is_read_io(fio->op) ?
-			__read_io_type(page) : WB_DATA_TYPE(fio->page, false));
+			__read_io_type(page) : WB_DATA_TYPE(fio->page));
 
 	if (is_read_io(bio_op(bio)))
 		f2fs_submit_read_bio(fio->sbi, bio, fio->type);
@@ -1017,7 +1019,7 @@ alloc_new:
 	if (fio->io_wbc)
 		wbc_account_cgroup_owner(fio->io_wbc, fio->page, PAGE_SIZE);
 
-	inc_page_count(fio->sbi, WB_DATA_TYPE(page, false));
+	inc_page_count(fio->sbi, WB_DATA_TYPE(page));
 
 	*fio->last_block = fio->new_blkaddr;
 	*fio->bio = bio;
@@ -1051,12 +1053,11 @@ void f2fs_submit_page_write(struct f2fs_io_info *fio)
 	enum page_type btype = PAGE_TYPE_OF_BIO(fio->type);
 	struct f2fs_bio_info *io = sbi->write_io[btype] + fio->temp;
 	struct page *bio_page;
-	enum count_type type;
 
 	f2fs_bug_on(sbi, is_read_io(fio->op));
 
 	f2fs_down_write(&io->io_rwsem);
-next:
+
 #ifdef CONFIG_BLK_DEV_ZONED
 	if (f2fs_sb_has_blkzoned(sbi) && btype < META && io->zone_pending_bio) {
 		wait_for_completion_io(&io->zone_wait);
@@ -1066,6 +1067,7 @@ next:
 	}
 #endif
 
+next:
 	if (fio->in_list) {
 		spin_lock(&io->io_lock);
 		if (list_empty(&io->io_list)) {
@@ -1090,8 +1092,7 @@ next:
 	/* set submitted = true as a return value */
 	fio->submitted = 1;
 
-	type = WB_DATA_TYPE(bio_page, fio->compressed_page);
-	inc_page_count(sbi, type);
+	inc_page_count(sbi, WB_DATA_TYPE(bio_page));
 
 	if (io->bio &&
 	    (!io_is_mergeable(sbi, io->bio, io, fio, io->last_block_in_bio,
@@ -1111,8 +1112,7 @@ alloc_new:
 		if (F2FS_IO_ALIGNED(sbi) &&
 				(fio->type == DATA || fio->type == NODE) &&
 				fio->new_blkaddr & F2FS_IO_SIZE_MASK(sbi)) {
-			dec_page_count(sbi, WB_DATA_TYPE(bio_page,
-						fio->compressed_page));
+			dec_page_count(sbi, WB_DATA_TYPE(bio_page));
 			fio->retry = 1;
 			goto skip;
 		}
@@ -1133,6 +1133,10 @@ alloc_new:
 	io->last_block_in_bio = fio->new_blkaddr;
 
 	trace_f2fs_submit_page_write(fio->page, fio);
+skip:
+	if (fio->in_list)
+		goto next;
+out:
 #ifdef CONFIG_BLK_DEV_ZONED
 	if (f2fs_sb_has_blkzoned(sbi) && btype < META &&
 			is_end_zone_blkaddr(sbi, fio->new_blkaddr)) {
@@ -1145,10 +1149,6 @@ alloc_new:
 		__submit_merged_bio(io);
 	}
 #endif
-skip:
-	if (fio->in_list)
-		goto next;
-out:
 	if (is_sbi_flag_set(sbi, SBI_IS_SHUTDOWN) ||
 				!f2fs_is_checkpoint_ready(sbi))
 		__submit_merged_bio(io);
@@ -1229,12 +1229,18 @@ static int f2fs_submit_page_read(struct inode *inode, struct page *page,
 	return 0;
 }
 
-static void __set_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
+static void __set_data_blkaddr(struct dnode_of_data *dn)
 {
-	__le32 *addr = get_dnode_addr(dn->inode, dn->node_page);
+	struct f2fs_node *rn = F2FS_NODE(dn->node_page);
+	__le32 *addr_array;
+	int base = 0;
 
-	dn->data_blkaddr = blkaddr;
-	addr[dn->ofs_in_node] = cpu_to_le32(dn->data_blkaddr);
+	if (IS_INODE(dn->node_page) && f2fs_has_extra_attr(dn->inode))
+		base = get_extra_isize(dn->inode);
+
+	/* Get physical address of data block */
+	addr_array = blkaddr_in_node(rn);
+	addr_array[base + dn->ofs_in_node] = cpu_to_le32(dn->data_blkaddr);
 }
 
 /*
@@ -1243,17 +1249,18 @@ static void __set_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
  *  ->node_page
  *    update block addresses in the node page
  */
-void f2fs_set_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
+void f2fs_set_data_blkaddr(struct dnode_of_data *dn)
 {
 	f2fs_wait_on_page_writeback(dn->node_page, NODE, true, true);
-	__set_data_blkaddr(dn, blkaddr);
+	__set_data_blkaddr(dn);
 	if (set_page_dirty(dn->node_page))
 		dn->node_changed = true;
 }
 
 void f2fs_update_data_blkaddr(struct dnode_of_data *dn, block_t blkaddr)
 {
-	f2fs_set_data_blkaddr(dn, blkaddr);
+	dn->data_blkaddr = blkaddr;
+	f2fs_set_data_blkaddr(dn);
 	f2fs_update_read_extent_cache(dn);
 }
 
@@ -1268,8 +1275,7 @@ int f2fs_reserve_new_blocks(struct dnode_of_data *dn, blkcnt_t count)
 
 	if (unlikely(is_inode_flag_set(dn->inode, FI_NO_ALLOC)))
 		return -EPERM;
-	err = inc_valid_block_count(sbi, dn->inode, &count, true);
-	if (unlikely(err))
+	if (unlikely((err = inc_valid_block_count(sbi, dn->inode, &count))))
 		return err;
 
 	trace_f2fs_reserve_new_blocks(dn->inode, dn->nid,
@@ -1281,7 +1287,8 @@ int f2fs_reserve_new_blocks(struct dnode_of_data *dn, blkcnt_t count)
 		block_t blkaddr = f2fs_data_blkaddr(dn);
 
 		if (blkaddr == NULL_ADDR) {
-			__set_data_blkaddr(dn, NEW_ADDR);
+			dn->data_blkaddr = NEW_ADDR;
+			__set_data_blkaddr(dn);
 			count--;
 		}
 	}
@@ -1531,21 +1538,20 @@ static int __allocate_data_block(struct dnode_of_data *dn, int seg_type)
 
 	dn->data_blkaddr = f2fs_data_blkaddr(dn);
 	if (dn->data_blkaddr == NULL_ADDR) {
-		err = inc_valid_block_count(sbi, dn->inode, &count, true);
+		err = inc_valid_block_count(sbi, dn->inode, &count);
 		if (unlikely(err))
 			return err;
 	}
 
 	set_summary(&sum, dn->nid, dn->ofs_in_node, ni.version);
 	old_blkaddr = dn->data_blkaddr;
-	err = f2fs_allocate_data_block(sbi, NULL, old_blkaddr,
-				&dn->data_blkaddr, &sum, seg_type, NULL);
-	if (err)
-		return err;
-
-	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
-		f2fs_invalidate_internal_cache(sbi, old_blkaddr, 1);
-
+	f2fs_allocate_data_block(sbi, NULL, old_blkaddr, &dn->data_blkaddr,
+				&sum, seg_type, NULL);
+	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO) {
+		invalidate_mapping_pages(META_MAPPING(sbi),
+					old_blkaddr, old_blkaddr);
+		f2fs_invalidate_compress_page(sbi, old_blkaddr);
+	}
 	f2fs_update_data_blkaddr(dn, dn->data_blkaddr);
 	return 0;
 }
@@ -1739,7 +1745,9 @@ next_block:
 			map->m_flags |= F2FS_MAP_NEW;
 	} else if (is_hole) {
 		if (f2fs_compressed_file(inode) &&
-		    f2fs_sanity_check_cluster(&dn)) {
+		    f2fs_sanity_check_cluster(&dn) &&
+		    (flag != F2FS_GET_BLOCK_FIEMAP ||
+		     IS_ENABLED(CONFIG_F2FS_CHECK_FS))) {
 			err = -EFSCORRUPTED;
 			f2fs_handle_error(sbi,
 					ERROR_CORRUPTED_CLUSTER);
@@ -1998,6 +2006,25 @@ static int f2fs_xattr_fiemap(struct inode *inode,
 	return (err < 0 ? err : 0);
 }
 
+static loff_t max_inode_blocks(struct inode *inode)
+{
+	loff_t result = ADDRS_PER_INODE(inode);
+	loff_t leaf_count = ADDRS_PER_BLOCK(inode);
+
+	/* two direct node blocks */
+	result += (leaf_count * 2);
+
+	/* two indirect node blocks */
+	leaf_count *= NIDS_PER_BLOCK;
+	result += (leaf_count * 2);
+
+	/* one double indirect node block */
+	leaf_count *= NIDS_PER_BLOCK;
+	result += leaf_count;
+
+	return result;
+}
+
 int f2fs_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
 		u64 start, u64 len)
 {
@@ -2070,7 +2097,8 @@ next:
 	if (!compr_cluster && !(map.m_flags & F2FS_MAP_FLAGS)) {
 		start_blk = next_pgofs;
 
-		if (blks_to_bytes(inode, start_blk) < maxbytes)
+		if (blks_to_bytes(inode, start_blk) < blks_to_bytes(inode,
+						max_inode_blocks(inode)))
 			goto prep_next;
 
 		flags |= FIEMAP_EXTENT_LAST;
@@ -2524,7 +2552,7 @@ static int f2fs_mpage_readpages(struct inode *inode,
 		}
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
-		if (f2fs_has_compressed_data(inode)) {
+		if (f2fs_compressed_file(inode)) {
 			/* there are remained compressed pages, submit them */
 			if (!f2fs_cluster_can_merge_page(&cc, page->index)) {
 				ret = f2fs_read_multi_pages(&cc, &bio,
@@ -2579,7 +2607,7 @@ next_page:
 			put_page(page);
 
 #ifdef CONFIG_F2FS_FS_COMPRESSION
-		if (f2fs_has_compressed_data(inode)) {
+		if (f2fs_compressed_file(inode)) {
 			/* last page */
 			if (nr_pages == 1 && !f2fs_cluster_is_empty(&cc)) {
 				ret = f2fs_read_multi_pages(&cc, &bio,
@@ -2643,6 +2671,9 @@ int f2fs_encrypt_one_page(struct f2fs_io_info *fio)
 		return 0;
 
 	page = fio->compressed_page ? fio->compressed_page : fio->page;
+
+	/* wait for GCed page writeback via META_MAPPING */
+	f2fs_wait_on_block_writeback(inode, fio->old_blkaddr);
 
 	if (fscrypt_inode_uses_inline_crypto(inode))
 		return 0;
@@ -2742,7 +2773,7 @@ bool f2fs_should_update_outplace(struct inode *inode, struct f2fs_io_info *fio)
 		return true;
 	if (IS_NOQUOTA(inode))
 		return true;
-	if (f2fs_used_in_atomic_write(inode))
+	if (f2fs_is_atomic_file(inode))
 		return true;
 
 	/* swap file is migrating in aligned write mode */
@@ -2781,13 +2812,10 @@ int f2fs_do_write_data_page(struct f2fs_io_info *fio)
 	struct dnode_of_data dn;
 	struct node_info ni;
 	bool ipu_force = false;
-	bool atomic_commit;
 	int err = 0;
 
 	/* Use COW inode to make dnode_of_data for atomic write */
-	atomic_commit = f2fs_is_atomic_file(inode) &&
-				page_private_atomic(fio->page);
-	if (atomic_commit)
+	if (f2fs_is_atomic_file(inode))
 		set_new_dnode(&dn, F2FS_I(inode)->cow_inode, NULL, NULL, 0);
 	else
 		set_new_dnode(&dn, inode, NULL, NULL, 0);
@@ -2831,10 +2859,6 @@ got_it:
 		f2fs_handle_error(fio->sbi, ERROR_INVALID_BLKADDR);
 		goto out_writepage;
 	}
-
-	/* wait for GCed page writeback via META_MAPPING */
-	if (fio->meta_gc)
-		f2fs_wait_on_block_writeback(inode, fio->old_blkaddr);
 
 	if (file_is_hot(inode))
 		F2FS_I_SB(inode)->sec_stat.hot_file_written_blocks++;
@@ -2898,8 +2922,8 @@ got_it:
 	f2fs_outplace_write_data(&dn, fio);
 	trace_f2fs_do_write_data_page(page, OPU);
 	set_inode_flag(inode, FI_APPEND_WRITE);
-	if (atomic_commit)
-		clear_page_private_atomic(page);
+	if (page->index == 0)
+		set_inode_flag(inode, FI_FIRST_BLOCK_WRITTEN);
 out_writepage:
 	f2fs_put_dnode(&dn);
 out:
@@ -2937,8 +2961,8 @@ int f2fs_write_single_data_page(struct page *page, int *submitted,
 		.encrypted_page = NULL,
 		.submitted = 0,
 		.compr_blocks = compr_blocks,
-		.need_lock = compr_blocks ? LOCK_DONE : LOCK_RETRY,
-		.meta_gc = f2fs_meta_inode_gc_required(inode) ? 1 : 0,
+		.need_lock = LOCK_RETRY,
+		.post_read = f2fs_post_read_required(inode) ? 1 : 0,
 		.io_type = io_type,
 		.io_wbc = wbc,
 		.bio = bio,
@@ -2980,6 +3004,9 @@ int f2fs_write_single_data_page(struct page *page, int *submitted,
 
 	zero_user_segment(page, offset, PAGE_SIZE);
 write:
+	if (f2fs_is_drop_cache(inode))
+		goto out;
+
 	/* Dentry/quota blocks are controlled by checkpoint */
 	if (S_ISDIR(inode->i_mode) || quota_inode) {
 		/*
@@ -3016,7 +3043,6 @@ write:
 	if (err == -EAGAIN) {
 		err = f2fs_do_write_data_page(&fio);
 		if (err == -EAGAIN) {
-			f2fs_bug_on(sbi, compr_blocks);
 			fio.need_lock = LOCK_REQ;
 			err = f2fs_do_write_data_page(&fio);
 		}
@@ -3949,9 +3975,6 @@ static int f2fs_write_end(struct file *file,
 
 	set_page_dirty(page);
 
-	if (f2fs_is_atomic_file(inode))
-		set_page_private_atomic(page);
-
 	if (pos + copied > i_size_read(inode) &&
 	    !f2fs_verity_in_progress(inode)) {
 		f2fs_i_size_write(inode, pos + copied);
@@ -4244,7 +4267,7 @@ next:
 	sis->highest_bit = cur_lblock - 1;
 out:
 	if (not_aligned)
-		f2fs_warn(sbi, "Swapfile (%u) is not align to section: 1) creat(), 2) ioctl(F2FS_IOC_SET_PIN_FILE), 3) fallocate(%lu * N)",
+		f2fs_warn(sbi, "Swapfile (%u) is not align to section: 1) creat(), 2) ioctl(F2FS_IOC_SET_PIN_FILE), 3) fallocate(%u * N)",
 			  not_aligned, blks_per_sec * F2FS_BLKSIZE);
 	return ret;
 }
@@ -4427,7 +4450,7 @@ static int f2fs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	if (WARN_ON_ONCE(map.m_pblk == COMPRESS_ADDR))
 		return -EINVAL;
 
-	if (map.m_flags & F2FS_MAP_MAPPED) {
+	if (map.m_pblk != NULL_ADDR) {
 		iomap->length = blks_to_bytes(inode, map.m_len);
 		iomap->type = IOMAP_MAPPED;
 		iomap->flags |= IOMAP_F_MERGED;

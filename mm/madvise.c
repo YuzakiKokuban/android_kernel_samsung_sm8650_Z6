@@ -11,7 +11,6 @@
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
 #include <linux/page-isolation.h>
-#include <linux/pgsize_migration.h>
 #include <linux/page_idle.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/hugetlb.h>
@@ -43,7 +42,6 @@ struct madvise_walk_private {
 	struct mmu_gather *tlb;
 	struct vm_area_struct *vma;
 	bool pageout;
-	void *private;
 	bool writeback;
 	bool prefetch;
 };
@@ -108,7 +106,6 @@ struct anon_vma_name *anon_vma_name(struct vm_area_struct *vma)
 
 	return vma->anon_name;
 }
-EXPORT_SYMBOL_GPL(anon_vma_name);
 
 /* mmap_lock should be write-locked */
 static int replace_anon_vma_name(struct vm_area_struct *vma,
@@ -438,7 +435,6 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 			tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
 		}
 
-		trace_android_vh_madvise_cold_or_pageout_page(pageout, page);
 		ClearPageReferenced(page);
 		test_and_clear_page_young(page);
 		if (pageout) {
@@ -453,7 +449,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 huge_unlock:
 		spin_unlock(ptl);
 		if (pageout)
-			__reclaim_pages(&page_list, private->private);
+			reclaim_pages(&page_list);
 		return 0;
 	}
 
@@ -475,8 +471,7 @@ regular_page:
 
 		if (!pte_present(ptent) && writeback) {
 			entry = pte_to_swp_entry(ptent);
-			if (!is_migration_entry(entry))
-				trace_android_vh_madvise_pageout_swap_entry(entry,
+			trace_android_vh_madvise_pageout_swap_entry(entry,
 					swp_swapcount(entry));
 			continue;
 		}
@@ -552,7 +547,6 @@ regular_page:
 		 * As a side effect, it makes confuse idle-page tracking
 		 * because they will miss recent referenced history.
 		 */
-		trace_android_vh_madvise_cold_or_pageout_page(pageout, page);
 		ClearPageReferenced(page);
 		test_and_clear_page_young(page);
 		if (pageout) {
@@ -569,7 +563,7 @@ regular_page:
 	arch_leave_lazy_mmu_mode();
 	pte_unmap_unlock(orig_pte, ptl);
 	if (pageout)
-		__reclaim_pages(&page_list, private->private);
+		reclaim_pages(&page_list);
 	cond_resched();
 
 	return 0;
@@ -629,18 +623,10 @@ static int madvise_pageout_page_range(struct mmu_gather *tlb,
 		.writeback = writeback,
 	};
 	int err;
-	LIST_HEAD(folio_list);
-
-	trace_android_rvh_madvise_pageout_begin(&walk_private.private);
 
 	tlb_start_vma(tlb, vma);
 	err = walk_page_range(vma->vm_mm, addr, end, &cold_walk_ops, &walk_private);
 	tlb_end_vma(tlb, vma);
-
-	trace_android_rvh_madvise_pageout_end(walk_private.private, &folio_list);
-	if (!list_empty(&folio_list))
-		reclaim_pages(&folio_list);
-
 	return err;
 }
 
@@ -879,8 +865,6 @@ static int madvise_free_single_vma(struct vm_area_struct *vma,
 static long madvise_dontneed_single_vma(struct vm_area_struct *vma,
 					unsigned long start, unsigned long end)
 {
-	madvise_vma_pad_pages(vma, start, end);
-
 	zap_page_range_single(vma, start, end - start, NULL);
 	return 0;
 }

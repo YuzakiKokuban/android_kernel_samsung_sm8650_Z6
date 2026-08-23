@@ -87,8 +87,7 @@ static int clk_mt8192_aud_probe(struct platform_device *pdev)
 	if (!clk_data)
 		return -ENOMEM;
 
-	r = mtk_clk_register_gates(&pdev->dev, node, aud_clks,
-				   ARRAY_SIZE(aud_clks), clk_data);
+	r = mtk_clk_register_gates(node, aud_clks, ARRAY_SIZE(aud_clks), clk_data);
 	if (r)
 		return r;
 
@@ -115,5 +114,5 @@ static struct platform_driver clk_mt8192_aud_drv = {
 		.of_match_table = of_match_clk_mt8192_aud,
 	},
 };
-module_platform_driver(clk_mt8192_aud_drv);
-MODULE_LICENSE("GPL");
+
+builtin_platform_driver(clk_mt8192_aud_drv);
